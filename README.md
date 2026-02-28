@@ -51,16 +51,6 @@ Each unique call stack maintains:
 
 ---
 
-## Installation
-
-Build the agent:
-
-```bash
-mvn clean package
-```
-
----
-
 ## Running the Agent
 
 Attach using `-javaagent`.
@@ -68,7 +58,7 @@ Attach using `-javaagent`.
 ### Example
 
 ```bash
-java -javaagent:precise-profiler-<version>.jar=packages=<com.package1|com.package2>,dryRun=<true|false> \
+java -javaagent:precise-profiler-<version>.jar=packages=<com.package1|com.package2>,histogram=<true|false> \
      -jar your-app.jar
 ```
 
@@ -88,22 +78,13 @@ Only classes in those packages will be instrumented.
 
 ---
 
-### `dryRun` (optional)
+### `histogram` (optional)
 
 ```
-dryRun=true
+histogram=true
 ```
 
-When enabled:
-
-- Detects hash collisions between stack paths
-- Logs both colliding stacks
-- Adds minor overhead
-
-Recommended workflow:
-
-1. Run once with `dryRun=true`
-2. If no collisions are reported, disable for production runs
+Histograms will be created and used only if the flag is set to true
 
 ---
 
