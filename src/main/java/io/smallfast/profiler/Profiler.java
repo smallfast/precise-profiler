@@ -51,13 +51,13 @@ public final class Profiler {
     }
 
     public static void exit() {
+        long end = System.nanoTime();
         State s = TL.get();
         int d = s.depth - 1;
         if (d < 0) { s.depth = 0; return; }
 
         s.depth = d;
 
-        long end = System.nanoTime();
         Node node = s.stackNode[d];
 
         long total = end - s.stackStartNs[d];
