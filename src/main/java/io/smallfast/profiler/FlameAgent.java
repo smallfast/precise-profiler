@@ -14,8 +14,8 @@ public final class FlameAgent {
     public static void premain(String args, Instrumentation inst) {
         Config cfg = Config.parse(args);
 
-        // expose config to profiler
         Profiler.setDryRun(cfg.dryRun);
+        Profiler.setHistogramEnabled(cfg.histogram);
 
         ElementMatcher<TypeDescription> typeMatcher = new ElementMatcher<>() {
             @Override
@@ -25,14 +25,20 @@ public final class FlameAgent {
         };
 
         new AgentBuilder.Default()
+                .with(AgentBuilder.Listener.StreamWriting.toSystemOut())
                 .ignore(
                         nameStartsWith("net.bytebuddy.")
-                                .or(nameStartsWith("io.smallfast.profiler."))
+                                .or(nameStartsWith("com.ppb.instrumentation."))
+                                .or(nameStartsWith("java."))
+                                .or(nameStartsWith("jdk."))
+                                .or(nameStartsWith("sun."))
                 )
                 .type(typeMatcher)
                 .transform((builder, typeDescription, classLoader, module, protectionDomain) ->
                         builder.visit(
-                                Advice.to(TraceAdvice.class)
+                                Advice.withCustomMapping()
+                                        .bind(new MethodIdMapping.Factory())
+                                        .to(TraceAdvice.class)
                                         .on(isMethod()
                                                 .and(not(isConstructor()))
                                                 .and(not(isAbstract()))
@@ -42,4 +48,6 @@ public final class FlameAgent {
                 )
                 .installOn(inst);
     }
+
+
 }

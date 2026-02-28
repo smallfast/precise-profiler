@@ -6,24 +6,22 @@ import java.io.IOException;
 import java.io.PrintWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 public final class Profiler {
 
-    // ThreadId -> State (for dump)
     private static final ConcurrentHashMap<Long, State> STATES = new ConcurrentHashMap<>();
+    private static volatile boolean DRY_RUN = false; // not used by tree (no hashing), kept for compatibility
 
-    // dry-run collision detection (only logs when collision is found)
-    private static volatile boolean DRY_RUN = false;
-
-    // Histogram config (nanoseconds)
-    // Adjust if you expect larger self-times for a single method.
-    private static final long HIST_MAX_NS = 30_000_000_000L; // 30s in ns
+    private static final long HIST_MAX_NS = 30_000_000_000L; // 30s
     private static final int HIST_SIG_DIGITS = 3;
+    private static boolean ENABLE_HISTOGRAM = false;
 
-    public static void setDryRun(boolean v) {
-        DRY_RUN = v;
+    public static void setHistogramEnabled(boolean enabled) {
+        ENABLE_HISTOGRAM = enabled;
     }
+    public static void setDryRun(boolean v) { DRY_RUN = v; }
 
     private static final ThreadLocal<State> TL = ThreadLocal.withInitial(() -> {
         Thread t = Thread.currentThread();
@@ -34,82 +32,77 @@ public final class Profiler {
 
     private Profiler() {}
 
+    // ---------------- hot path ----------------
+
     public static void enter(int methodId) {
         State s = TL.get();
         int d = s.depth;
 
-        if (d == s.stackMethod.length) {
-            s.growStacks();
-        }
+        if (d == s.stackNode.length) s.growStacks();
 
-        s.stackMethod[d] = methodId;
-        s.stackChildNs[d] = 0L;
-        s.depth = d + 1;
+        Node parent = (d == 0) ? s.root : s.stackNode[d - 1];
+        Node child = parent.getOrCreateChild(methodId);
+
+        s.stackNode[d] = child;
         s.stackStartNs[d] = System.nanoTime();
+        s.stackChildNs[d] = 0L;
+
+        s.depth = d + 1;
     }
 
     public static void exit() {
-        long end = System.nanoTime();
-
         State s = TL.get();
         int d = s.depth - 1;
-        if (d < 0) {
-            s.depth = 0;
-            return;
-        }
+        if (d < 0) { s.depth = 0; return; }
+
         s.depth = d;
 
-        int methodId = s.stackMethod[d];
+        long end = System.nanoTime();
+        Node node = s.stackNode[d];
+
         long total = end - s.stackStartNs[d];
         long self = total - s.stackChildNs[d];
 
-        // propagate inclusive time to parent as "child time"
+        // propagate inclusive to parent as child time
         if (d > 0) {
             s.stackChildNs[d - 1] += total;
         }
 
-        // record SELF time for this stack path
-        s.map.add(s, s.stackMethod, d, methodId, self);
-    }
-
-    /** Dump flamegraph collapsed files (self-time) one per thread into dir. */
-    public static void dumpPerThread(Path dir) throws IOException {
-        Files.createDirectories(dir);
-        for (State s : STATES.values()) {
-            Path out = dir.resolve("collapsed-" + sanitize(s.threadName) + "-" + s.tid + ".txt");
-            try (PrintWriter w = new PrintWriter(Files.newBufferedWriter(out))) {
-                s.map.dumpToCollapsed(w);
+        if (self > 0) {
+            node.totalSelfNs += self;
+            if (ENABLE_HISTOGRAM) {
+                recordHistogram(node.hist, self);
             }
         }
     }
+
+    // ---------------- dumps ----------------
 
     public static void dumpSpeedscopePerThread(Path dir) throws IOException {
         Files.createDirectories(dir);
-
         for (State s : STATES.values()) {
             Path out = dir.resolve("thread-" + sanitize(s.threadName) + "-" + s.tid + ".speedscope.json");
             try (PrintWriter w = new PrintWriter(Files.newBufferedWriter(out))) {
-                s.map.dumpToSpeedscope(w, s.threadName);
+                dumpTreeToSpeedscope(w, s, s.threadName + "-" + s.tid);
             }
         }
     }
 
-    /** Dump percentiles CSV (self-time) one per thread into dir. */
     public static void dumpPercentilesPerThread(Path dir) throws IOException {
         Files.createDirectories(dir);
         for (State s : STATES.values()) {
             Path out = dir.resolve("percentiles-" + sanitize(s.threadName) + "-" + s.tid + ".csv");
             try (PrintWriter w = new PrintWriter(Files.newBufferedWriter(out))) {
                 w.println("stack,p50_ns,p90_ns,p99_ns,p999_ns,p100_ns,count");
-                s.map.dumpPercentilesCsv(w);
+                dumpTreeToPercentilesCsv(w, s);
             }
         }
     }
 
-    /** Optional: clear all data after dump. */
     public static void resetAll() {
         for (State s : STATES.values()) {
-            s.map.reset();
+            s.root.resetSubtree();
+            s.depth = 0;
         }
     }
 
@@ -123,17 +116,19 @@ public final class Profiler {
         return sb.toString();
     }
 
+    // ---------------- state / tree ----------------
+
     static final class State {
         final String threadName;
         final long tid;
 
         int depth = 0;
 
-        int[] stackMethod = new int[256];
+        Node[] stackNode = new Node[256];
         long[] stackStartNs = new long[256];
         long[] stackChildNs = new long[256];
 
-        final StackMap map = new StackMap();
+        final Node root = new Node(0);
 
         State(String threadName, long tid) {
             this.threadName = threadName;
@@ -141,350 +136,259 @@ public final class Profiler {
         }
 
         void growStacks() {
-            int newCap = stackMethod.length << 1;
-
-            int[] nm = new int[newCap];
-            long[] ns = new long[newCap];
-            long[] nc = new long[newCap];
-
-            System.arraycopy(stackMethod, 0, nm, 0, stackMethod.length);
-            System.arraycopy(stackStartNs, 0, ns, 0, stackStartNs.length);
-            System.arraycopy(stackChildNs, 0, nc, 0, stackChildNs.length);
-
-            stackMethod = nm;
-            stackStartNs = ns;
-            stackChildNs = nc;
+            int newCap = stackNode.length << 1;
+            stackNode = Arrays.copyOf(stackNode, newCap);
+            stackStartNs = Arrays.copyOf(stackStartNs, newCap);
+            stackChildNs = Arrays.copyOf(stackChildNs, newCap);
         }
     }
 
-    /**
-     * Hash-bucket map of stack(parents int[]) + leaf -> accumulated self ns + HDR histogram.
-     * Collision-safe via full compare. Per-thread (no synchronization needed inside).
-     */
-    static final class StackMap {
-        private Entry[] buckets = new Entry[1 << 14]; // 16384
-        private int size = 0;
+    // A node represents a unique call-path element: (parent, methodId).
+    static final class Node {
+        final int methodId;
 
-        void add(State owner, int[] parentStack, int parentLen, int leafMethodId, long selfNs) {
-            if (selfNs <= 0) return;
+        long totalSelfNs = 0;
+        Histogram hist; // nullable
 
-            long h = hash(parentStack, parentLen, leafMethodId);
-            int idx = ((int) h) & (buckets.length - 1);
+        // Children stored in parallel arrays (fast for small branching factor)
+        int[] childMethodId = new int[4];
+        Node[] childNode = new Node[4];
+        int childCount = 0;
 
-            Entry e = buckets[idx];
-            while (e != null) {
-                if (e.hash == h) {
-                    boolean same =
-                            (e.parentLen == parentLen) &&
-                                    (e.leaf == leafMethodId) &&
-                                    equalsParents(e.parents, parentStack, parentLen);
+        Node(int methodId) {
+            this.methodId = methodId;
+            if (ENABLE_HISTOGRAM) {
+                this.hist = new Histogram(HIST_MAX_NS, HIST_SIG_DIGITS);
+            }
+        }
 
-                    if (same) {
-                        e.totalSelfNs += selfNs;
-                        // record self-time into histogram (clamp to max trackable)
-                        recordHistogram(e.hist, selfNs);
-                        return;
-                    } else {
-                        if (DRY_RUN && !e.reportedCollision) {
-                            e.reportedCollision = true;
-                            reportCollision(owner, h, e, parentStack, parentLen, leafMethodId);
-                        }
+        Node getOrCreateChild(int mid) {
+            // linear scan is usually fastest (small childCount, contiguous memory)
+            for (int i = 0; i < childCount; i++) {
+                if (childMethodId[i] == mid) return childNode[i];
+            }
+            // create
+            Node n = new Node(mid);
+            if (childCount == childMethodId.length) {
+                int newCap = childCount << 1;
+                childMethodId = Arrays.copyOf(childMethodId, newCap);
+                childNode = Arrays.copyOf(childNode, newCap);
+            }
+            childMethodId[childCount] = mid;
+            childNode[childCount] = n;
+            childCount++;
+            return n;
+        }
+
+        void resetSubtree() {
+            // iterative DFS to avoid recursion depth issues
+            ArrayDeque<Node> q = new ArrayDeque<>();
+            q.add(this);
+            while (!q.isEmpty()) {
+                Node n = q.removeLast();
+                n.totalSelfNs = 0;
+                if (ENABLE_HISTOGRAM && n.hist != null) {
+                    n.hist.reset();
+                }
+                for (int i = 0; i < n.childCount; i++) {
+                    q.add(n.childNode[i]);
+                }
+            }
+        }
+    }
+
+    private static void recordHistogram(Histogram h, long valueNs) {
+        if (valueNs <= 0) return;
+        if (valueNs > HIST_MAX_NS) h.recordValue(HIST_MAX_NS);
+        else h.recordValue(valueNs);
+    }
+
+    // ---------------- export helpers ----------------
+
+    private static final class PathEntry {
+        final int[] frames; // methodIds for the stack (excluding synthetic root)
+        final int len;
+        final long weight; // totalSelfNs
+        final Histogram hist;
+
+        PathEntry(int[] frames, int len, long weight, Histogram hist) {
+            this.frames = frames;
+            this.len = len;
+            this.weight = weight;
+            this.hist = hist;
+        }
+    }
+
+    private static List<PathEntry> collectPathEntries(State s) {
+        // iterative DFS over tree, maintaining a methodId path stack
+        ArrayList<PathEntry> out = new ArrayList<>();
+
+        int[] path = new int[256];
+        int depth = 0;
+
+        // stack of iterators over children
+        ArrayDeque<IterFrame> st = new ArrayDeque<>();
+        st.push(new IterFrame(s.root, 0, false));
+
+        while (!st.isEmpty()) {
+            IterFrame f = st.peek();
+            Node n = f.node;
+
+            if (!f.entered) {
+                f.entered = true;
+                // push this node's methodId onto path (skip synthetic root methodId=0)
+                if (n.methodId != 0) {
+                    if (depth == path.length) path = Arrays.copyOf(path, depth << 1);
+                    path[depth++] = n.methodId;
+
+                    if (n.totalSelfNs > 0) {
+                        int[] copy = Arrays.copyOf(path, depth);
+                        out.add(new PathEntry(copy, depth, n.totalSelfNs, n.hist));
                     }
                 }
-                e = e.next;
             }
 
-            // New unique stack path: copy parents once
-            int[] copyParents = new int[parentLen];
-            if (parentLen > 0) System.arraycopy(parentStack, 0, copyParents, 0, parentLen);
-
-            Histogram hist = new Histogram(HIST_MAX_NS, HIST_SIG_DIGITS);
-            recordHistogram(hist, selfNs);
-
-            Entry ne = new Entry(h, copyParents, parentLen, leafMethodId, selfNs, hist, buckets[idx]);
-            buckets[idx] = ne;
-            size++;
-
-            if (size > (buckets.length * 4)) {
-                rehash();
-            }
-        }
-
-        void dumpToCollapsed(PrintWriter w) {
-            for (Entry head : buckets) {
-                Entry e = head;
-                while (e != null) {
-                    w.print(toCollapsedStack(e.parents, e.parentLen, e.leaf));
-                    w.print(' ');
-                    w.println(e.totalSelfNs);
-                    e = e.next;
-                }
-            }
-        }
-
-        void dumpPercentilesCsv(PrintWriter w) {
-            for (Entry head : buckets) {
-                Entry e = head;
-                while (e != null) {
-                    String stack = toCollapsedStack(e.parents, e.parentLen, e.leaf);
-                    Histogram h = e.hist;
-
-                    long p50 = h.getValueAtPercentile(50.0);
-                    long p90 = h.getValueAtPercentile(90.0);
-                    long p99 = h.getValueAtPercentile(99.0);
-                    long p999 = h.getValueAtPercentile(99.9);
-                    long p100 = h.getMaxValue();
-                    long count = h.getTotalCount();
-
-                    // CSV: stack,p50,p90,p99,p999,p100,count
-                    w.print(stack);
-                    w.print(',');
-                    w.print(p50);
-                    w.print(',');
-                    w.print(p90);
-                    w.print(',');
-                    w.print(p99);
-                    w.print(',');
-                    w.print(p999);
-                    w.print(',');
-                    w.print(p100);
-                    w.print(',');
-                    w.println(count);
-
-                    e = e.next;
-                }
-            }
-        }
-
-        void reset() {
-            buckets = new Entry[1 << 14];
-            size = 0;
-        }
-
-        private void rehash() {
-            Entry[] old = buckets;
-            Entry[] next = new Entry[old.length << 1];
-            int mask = next.length - 1;
-
-            for (Entry head : old) {
-                Entry e = head;
-                while (e != null) {
-                    Entry n = e.next;
-                    int idx = ((int) e.hash) & mask;
-                    e.next = next[idx];
-                    next[idx] = e;
-                    e = n;
-                }
-            }
-            buckets = next;
-        }
-
-        private static boolean equalsParents(int[] storedParents, int[] currentParents, int len) {
-            for (int i = 0; i < len; i++) {
-                if (storedParents[i] != currentParents[i]) return false;
-            }
-            return true;
-        }
-
-        private static long hash(int[] parents, int parentLen, int leaf) {
-            // FNV-1a 64-bit
-            long h = 1469598103934665603L;
-            for (int i = 0; i < parentLen; i++) {
-                h ^= (parents[i] * 0x9E3779B9L);
-                h *= 1099511628211L;
-            }
-            h ^= (leaf * 0x9E3779B9L);
-            h *= 1099511628211L;
-            return h;
-        }
-
-        private static void recordHistogram(Histogram h, long valueNs) {
-            // HDRHistogram throws if value > highestTrackableValue
-            if (valueNs <= 0) return;
-            if (valueNs > HIST_MAX_NS) {
-                h.recordValue(HIST_MAX_NS);
+            if (f.childIndex < n.childCount) {
+                Node child = n.childNode[f.childIndex++];
+                st.push(new IterFrame(child, 0, false));
             } else {
-                h.recordValue(valueNs);
+                st.pop();
+                // pop path on leaving node (if not root)
+                if (n.methodId != 0) depth--;
             }
         }
 
-        private static String toCollapsedStack(int[] parents, int parentLen, int leaf) {
-            // Semicolon-separated stack (flamegraph "collapsed" format)
-            StringBuilder sb = new StringBuilder(128);
-            for (int i = 0; i < parentLen; i++) {
-                if (i > 0) sb.append(';');
-                sb.append(ProfilerIds.nameFor(parents[i]));
-            }
-            if (parentLen > 0) sb.append(';');
-            sb.append(ProfilerIds.nameFor(leaf));
-            return sb.toString();
+        // optional: sort by weight (visual nicer + stable)
+        out.sort((a, b) -> Long.compare(b.weight, a.weight));
+        return out;
+    }
+
+    private static final class IterFrame {
+        final Node node;
+        int childIndex;
+        boolean entered;
+        IterFrame(Node node, int childIndex, boolean entered) {
+            this.node = node;
+            this.childIndex = childIndex;
+            this.entered = entered;
         }
+    }
 
-        private static void reportCollision(State owner, long hash, Entry existing,
-                                            int[] newParents, int newParentLen, int newLeaf) {
-            System.err.println("=== PROFILER HASH COLLISION DETECTED ===");
-            System.err.println("Thread: " + owner.threadName + " (id=" + owner.tid + ")");
-            System.err.println("Hash:   " + hash);
-            System.err.println("Stack1: " + stackToString(existing.parents, existing.parentLen, existing.leaf));
-            System.err.println("Stack2: " + stackToString(newParents, newParentLen, newLeaf));
-            System.err.println("=======================================");
+    private static void dumpTreeToPercentilesCsv(PrintWriter w, State s) {
+        if (!ENABLE_HISTOGRAM) {
+            w.println("Histograms disabled.");
+            return;
         }
+        List<PathEntry> entries = collectPathEntries(s);
+        for (PathEntry e : entries) {
+            String stack = toCollapsedStack(e.frames, e.len);
+            Histogram h = e.hist;
+            long p50 = h.getValueAtPercentile(50.0);
+            long p90 = h.getValueAtPercentile(90.0);
+            long p99 = h.getValueAtPercentile(99.0);
+            long p999 = h.getValueAtPercentile(99.9);
+            long p100 = h.getMaxValue();
+            long count = h.getTotalCount();
 
-        private static String stackToString(int[] parents, int parentLen, int leaf) {
-            StringBuilder sb = new StringBuilder(128);
-            for (int i = 0; i < parentLen; i++) {
-                if (i > 0) sb.append(" -> ");
-                sb.append(ProfilerIds.nameFor(parents[i]));
-            }
-            if (parentLen > 0) sb.append(" -> ");
-            sb.append(ProfilerIds.nameFor(leaf));
-            return sb.toString();
+            w.print(stack); w.print(',');
+            w.print(p50); w.print(',');
+            w.print(p90); w.print(',');
+            w.print(p99); w.print(',');
+            w.print(p999); w.print(',');
+            w.print(p100); w.print(',');
+            w.println(count);
         }
+    }
 
-        static final class Entry {
-            final long hash;
-            final int[] parents;
-            final int parentLen;
-            final int leaf;
+    private static void dumpTreeToSpeedscope(PrintWriter w, State s, String profileName) {
+        List<PathEntry> entries = collectPathEntries(s);
 
-            long totalSelfNs;     // sum of self-time across calls for this stack
-            final Histogram hist; // latency distribution of self-time per call
+        // Build frame table: methodId -> frameIndex, and frames list (names)
+        Map<Integer, Integer> midToIdx = new HashMap<>();
+        List<String> frames = new ArrayList<>();
 
-            Entry next;
-
-            boolean reportedCollision = false;
-
-            Entry(long hash, int[] parents, int parentLen, int leaf,
-                  long firstSelfNs, Histogram hist, Entry next) {
-                this.hash = hash;
-                this.parents = parents;
-                this.parentLen = parentLen;
-                this.leaf = leaf;
-                this.totalSelfNs = firstSelfNs;
-                this.hist = hist;
-                this.next = next;
-            }
-        }
-
-        void dumpToSpeedscope(PrintWriter w, String profileName) {
-
-            // 1️⃣ Collect entries into deterministic list
-            java.util.List<Entry> entries = new java.util.ArrayList<>();
-
-            for (Entry head : buckets) {
-                Entry e = head;
-                while (e != null) {
-                    entries.add(e);
-                    e = e.next;
+        for (PathEntry e : entries) {
+            for (int i = 0; i < e.len; i++) {
+                int mid = e.frames[i];
+                if (!midToIdx.containsKey(mid)) {
+                    midToIdx.put(mid, frames.size());
+                    frames.add(MethodRegistry.nameFor(mid));
                 }
             }
-
-            // 2️⃣ Build frame table
-            java.util.Map<Integer, Integer> methodIdToFrameIndex = new java.util.HashMap<>();
-            java.util.List<String> frames = new java.util.ArrayList<>();
-
-            for (Entry e : entries) {
-                for (int i = 0; i < e.parentLen; i++) {
-                    int mid = e.parents[i];
-                    if (!methodIdToFrameIndex.containsKey(mid)) {
-                        methodIdToFrameIndex.put(mid, frames.size());
-                        frames.add(ProfilerIds.nameFor(mid));
-                    }
-                }
-                int leaf = e.leaf;
-                if (!methodIdToFrameIndex.containsKey(leaf)) {
-                    methodIdToFrameIndex.put(leaf, frames.size());
-                    frames.add(ProfilerIds.nameFor(leaf));
-                }
-            }
-
-            // 3️⃣ Write JSON
-            w.println("{");
-            w.println("  \"$schema\": \"https://www.speedscope.app/file-format-schema.json\",");
-            w.println("  \"shared\": {");
-            w.println("    \"frames\": [");
-
-            for (int i = 0; i < frames.size(); i++) {
-                w.print("      { \"name\": \"");
-                w.print(escapeJson(frames.get(i)));
-                w.print("\" }");
-                if (i < frames.size() - 1) w.println(",");
-                else w.println();
-            }
-
-            w.println("    ]");
-            w.println("  },");
-            w.println("  \"profiles\": [");
-            w.println("    {");
-            w.println("      \"type\": \"sampled\",");
-            w.print("      \"name\": \"");
-            w.print(escapeJson(profileName));
-            w.println("\",");
-            w.println("      \"unit\": \"nanoseconds\",");
-
-            // 4️⃣ Samples
-            w.println("      \"samples\": [");
-
-            for (int i = 0; i < entries.size(); i++) {
-                Entry e = entries.get(i);
-
-                w.print("        [");
-
-                for (int j = 0; j < e.parentLen; j++) {
-                    int frameIndex = methodIdToFrameIndex.get(e.parents[j]);
-                    w.print(frameIndex);
-                    w.print(",");
-                }
-
-                int leafIndex = methodIdToFrameIndex.get(e.leaf);
-                w.print(leafIndex);
-
-                w.print("]");
-
-                if (i < entries.size() - 1) w.println(",");
-                else w.println();
-            }
-
-            w.println("      ],");
-
-            // 5️⃣ Weights (must match sample order exactly)
-            w.println("      \"weights\": [");
-
-            for (int i = 0; i < entries.size(); i++) {
-                Entry e = entries.get(i);
-                w.print("        ");
-                w.print(e.totalSelfNs);
-
-                if (i < entries.size() - 1) w.println(",");
-                else w.println();
-            }
-
-            w.println("      ]");
-
-            w.println("    }");
-            w.println("  ]");
-            w.println("}");
         }
 
-        private static String escapeJson(String s) {
-            StringBuilder sb = new StringBuilder(s.length() + 16);
-            for (int i = 0; i < s.length(); i++) {
-                char c = s.charAt(i);
-                switch (c) {
-                    case '\"': sb.append("\\\""); break;
-                    case '\\': sb.append("\\\\"); break;
-                    case '\n': sb.append("\\n"); break;
-                    case '\r': sb.append("\\r"); break;
-                    case '\t': sb.append("\\t"); break;
-                    default:
-                        if (c < 32) {
-                            sb.append(String.format("\\u%04x", (int)c));
-                        } else {
-                            sb.append(c);
-                        }
-                }
-            }
-            return sb.toString();
+        // JSON
+        w.println("{");
+        w.println("  \"$schema\": \"https://www.speedscope.app/file-format-schema.json\",");
+        w.println("  \"shared\": {");
+        w.println("    \"frames\": [");
+        for (int i = 0; i < frames.size(); i++) {
+            w.print("      { \"name\": \"");
+            w.print(escapeJson(frames.get(i)));
+            w.print("\" }");
+            if (i < frames.size() - 1) w.println(",");
+            else w.println();
         }
+        w.println("    ]");
+        w.println("  },");
+        w.println("  \"profiles\": [");
+        w.println("    {");
+        w.println("      \"type\": \"sampled\",");
+        w.print("      \"name\": \""); w.print(escapeJson(profileName)); w.println("\",");
+        w.println("      \"unit\": \"nanoseconds\",");
+        w.println("      \"samples\": [");
+
+        for (int i = 0; i < entries.size(); i++) {
+            PathEntry e = entries.get(i);
+            w.print("        [");
+            for (int j = 0; j < e.len; j++) {
+                int idx = midToIdx.get(e.frames[j]);
+                w.print(idx);
+                if (j < e.len - 1) w.print(",");
+            }
+            w.print("]");
+            if (i < entries.size() - 1) w.println(",");
+            else w.println();
+        }
+
+        w.println("      ],");
+        w.println("      \"weights\": [");
+        for (int i = 0; i < entries.size(); i++) {
+            w.print("        ");
+            w.print(entries.get(i).weight);
+            if (i < entries.size() - 1) w.println(",");
+            else w.println();
+        }
+        w.println("      ]");
+        w.println("    }");
+        w.println("  ]");
+        w.println("}");
+    }
+
+    private static String toCollapsedStack(int[] frames, int len) {
+        StringBuilder sb = new StringBuilder(128);
+        for (int i = 0; i < len; i++) {
+            if (i > 0) sb.append(';');
+            sb.append(MethodRegistry.nameFor(frames[i]));
+        }
+        return sb.toString();
+    }
+
+    private static String escapeJson(String s) {
+        StringBuilder sb = new StringBuilder(s.length() + 16);
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            switch (c) {
+                case '\"': sb.append("\\\""); break;
+                case '\\': sb.append("\\\\"); break;
+                case '\n': sb.append("\\n"); break;
+                case '\r': sb.append("\\r"); break;
+                case '\t': sb.append("\\t"); break;
+                default:
+                    if (c < 32) sb.append(String.format("\\u%04x", (int) c));
+                    else sb.append(c);
+            }
+        }
+        return sb.toString();
     }
 }
