@@ -28,7 +28,7 @@ public final class FlameAgent {
                 .with(AgentBuilder.Listener.StreamWriting.toSystemOut())
                 .ignore(
                         nameStartsWith("net.bytebuddy.")
-                                .or(nameStartsWith("com.ppb.instrumentation."))
+                                .or(nameStartsWith("io.smallfast.profiler."))
                                 .or(nameStartsWith("java."))
                                 .or(nameStartsWith("jdk."))
                                 .or(nameStartsWith("sun."))
