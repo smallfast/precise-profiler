@@ -2,6 +2,7 @@ package io.smallfast.profiler;
 
 import net.bytebuddy.agent.builder.AgentBuilder;
 import net.bytebuddy.asm.Advice;
+import net.bytebuddy.description.method.MethodDescription;
 import net.bytebuddy.description.type.TypeDescription;
 import net.bytebuddy.matcher.ElementMatcher;
 
@@ -43,7 +44,13 @@ public final class FlameAgent {
                                                 .and(not(isConstructor()))
                                                 .and(not(isAbstract()))
                                                 .and(not(isNative()))
-                                                .and(not(isSynthetic())))
+                                                .and(not(isSynthetic()))
+                                                .and(not(new ElementMatcher<MethodDescription>() {
+                                                    @Override
+                                                    public boolean matches(MethodDescription target) {
+                                                        return cfg.shouldSkipMethod(target.getName());
+                                                    }
+                                                })))
                         )
                 )
                 .installOn(inst);
